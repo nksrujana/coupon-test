@@ -1,9 +1,7 @@
 import pool from '../db.js';
 
 /**
- * Cancel an order.
- *
- * If the order used a coupon, its usage count is released.
+ * Cancel an order and release every coupon used by that order.
  *
  * @param {string} orderId
  * @returns {Promise<string>}
@@ -19,17 +17,12 @@ export async function cancelOrder(orderId) {
     await client.query('BEGIN');
 
     /*
-     * Lock the order.
-     *
-     * This prevents two terminal sessions from cancelling
+     * Lock the order so two terminals cannot cancel
      * the same order simultaneously.
      */
     const orderResult = await client.query(
       `
-      SELECT
-        id,
-        coupon_code,
-        status
+      SELECT id, status
       FROM orders
       WHERE id = $1
       FOR UPDATE
@@ -48,10 +41,55 @@ export async function cancelOrder(orderId) {
     }
 
     /*
-     * If the order used a coupon, lock the coupon row
-     * before modifying its usage count.
+     * Get all coupons used by this order.
+     *
+     * order_coupons supports both:
+     * - normal single-coupon orders
+     * - stacked orders
      */
-    if (order.coupon_code) {
+    const couponsResult = await client.query(
+      `
+      SELECT code
+      FROM order_coupons
+      WHERE order_id = $1
+      ORDER BY code
+      `,
+      [order.id]
+    );
+
+    /*
+     * Backward-compatible fallback:
+     * If an old/base order doesn't have an order_coupons row,
+     * use orders.coupon_code.
+     */
+    let couponCodes = couponsResult.rows.map(
+      (row) => row.code
+    );
+
+    if (couponCodes.length === 0) {
+      const fallbackResult = await client.query(
+        `
+        SELECT coupon_code
+        FROM orders
+        WHERE id = $1
+          AND coupon_code IS NOT NULL
+        `,
+        [order.id]
+      );
+
+      couponCodes = fallbackResult.rows
+        .map((row) => row.coupon_code)
+        .filter(Boolean);
+    }
+
+    /*
+     * Always lock coupons in deterministic order.
+     * This avoids deadlocks if multiple cancellation
+     * operations involve multiple coupons.
+     */
+    couponCodes = [...new Set(couponCodes)].sort();
+
+    for (const code of couponCodes) {
       const couponResult = await client.query(
         `
         SELECT code, times_used
@@ -59,16 +97,12 @@ export async function cancelOrder(orderId) {
         WHERE code = $1
         FOR UPDATE
         `,
-        [order.coupon_code]
+        [code]
       );
 
-      /*
-       * The foreign key means the coupon should normally
-       * exist. This check makes the failure explicit.
-       */
       if (couponResult.rowCount === 0) {
         throw new Error(
-          `Coupon '${order.coupon_code}' associated with order was not found`
+          `Coupon '${code}' associated with order was not found`
         );
       }
 
@@ -76,7 +110,7 @@ export async function cancelOrder(orderId) {
 
       if (coupon.times_used <= 0) {
         throw new Error(
-          `Coupon '${coupon.code}' usage count is already zero`
+          `Coupon '${code}' usage count is already zero`
         );
       }
 
@@ -86,12 +120,12 @@ export async function cancelOrder(orderId) {
         SET times_used = times_used - 1
         WHERE code = $1
         `,
-        [coupon.code]
+        [code]
       );
     }
 
     /*
-     * Mark order cancelled.
+     * Finally mark the order cancelled.
      */
     await client.query(
       `
